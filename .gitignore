@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Generated reports
+reports/
+*.txt
+!requirements.txt
+
+# Browser state (contains session cookies — never commit)
+.browser_state/
+cookies.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
