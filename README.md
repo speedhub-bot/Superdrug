@@ -2,51 +2,31 @@
 
 A small personal tool that signs into **your own** Superdrug account, then collects your publicly-visible account data — profile, Health & Beautycard, addresses, saved payment methods (masked, last 4 digits only, exactly as Superdrug itself displays them), order history, subscriptions — and writes it all into a single neatly-formatted `.txt` report you can hand to your boss.
 
-By default it runs in a hidden (headless) browser and asks you for your email and password at the terminal — no UI, no popping windows, just a clean CLI:
+When you run it you just get a numbered menu — no command-line flags to memorise:
 
 ```
 ============================================================
   Superdrug Account Report
 ============================================================
-  Account : you@example.com
-  Started : 2026-04-24 11:07:13
-------------------------------------------------------------
-  [..] Logging in...
-  [OK] Logged in (3.4s).
-------------------------------------------------------------
-  [..] Collecting Profile...
-  [OK] Profile: ok
-  [..] Collecting Health & Beautycard...
-  [OK] Health & Beautycard: ok
-  [..] Collecting Saved Addresses...
-  [OK] Saved Addresses: ok
-  [..] Collecting Saved Payment Methods...
-  [OK] Saved Payment Methods: ok
-  [..] Collecting Subscriptions...
-  [!!] Subscriptions: empty
-  [..] Collecting Order History...
-  [OK] Order History: ok
-------------------------------------------------------------
-  [OK] Report written to reports/superdrug_report_you_at_example_com_2026-04-24_1107.txt
-      (24,118 bytes)
+  How would you like to sign in?
+
+    1) Type my email + password   (silent / hidden browser, fast
+                                   — may fail if Superdrug bot-blocks)
+    2) Open Chrome for me          [most reliable]
+                                   I open your real Chrome, you sign in there.
+    3) Open a visible browser      Plays in front of you; sign in by hand.
+    4) Use cached session          Skip login if I've signed in before.
+    5) Quit
+
+  Pick [1-5]:
 ```
 
-If Superdrug shows a CAPTCHA or 2FA challenge during login, the tool **automatically reopens the browser visibly** and asks you to solve it in the window — once.
+## Which option should I pick?
 
-### If Superdrug keeps blocking the script
-
-Superdrug runs Akamai bot detection. Even with realistic User-Agent / `navigator.webdriver` patches, Akamai sometimes still flags Playwright's launched Chromium and refuses to let it sign in. **The bulletproof workaround is `--use-my-chrome`:** you start your own normal Chrome with a debug port, sign in to Superdrug like a human, then point the tool at it. Akamai sees a real human session because it *is* one.
-
-```bash
-# Terminal 1
-google-chrome --remote-debugging-port=9222
-# Sign in to https://www.superdrug.com normally in that window
-
-# Terminal 2
-python superdrug_report.py --use-my-chrome
-```
-
-No password prompt at all — the script just borrows your browser's already-authenticated session, scrapes, and exits. Your real Chrome window stays open and untouched.
+- **1 — Type my email + password.** Fastest. The browser stays hidden, the tool fills the login form for you and writes the report. Works most of the time, but Superdrug runs Akamai bot detection and sometimes flags the script — when it does, you'll see `[!!] Superdrug looks like it's flagging the script` and a suggestion to use option 2.
+- **2 — Open Chrome for me. *(most reliable)*** The tool launches your real Google Chrome with a Superdrug login tab already open, and you sign in there like a human. After signing in you press Enter back in the terminal and the rest is automatic. **No password ever leaves your browser** — the script only reads the already-authenticated session. Akamai sees a real human session because it *is* one. The Chrome window stays open afterwards so subsequent runs skip login entirely.
+- **3 — Open a visible browser.** Same as 2 but uses Playwright's bundled Chromium instead of your real Chrome. Slightly less reliable against bot detection.
+- **4 — Use cached session.** If you've already signed in once via 1, 2 or 3, this just re-uses the saved cookies. Instant. Falls back with a clear error if there's no cache yet.
 
 ## Intended use
 
@@ -54,7 +34,7 @@ No password prompt at all — the script just borrows your browser's already-aut
 
 - no combo-list / batch mode
 - no proxy rotation
-- no CAPTCHA solver or anti-bot evasion
+- no CAPTCHA solver or fingerprint-randomising "stealth" beyond the bare minimum needed to look like a normal browser instead of an obvious robot
 - no full card number extraction — Superdrug itself only shows the last 4 digits, and that's all the report contains
 
 Your password lives only in the running process's memory; it is never written to disk, never sent to any third party, and never stored anywhere unless you explicitly put it in an environment variable yourself.
@@ -63,7 +43,7 @@ You're responsible for complying with Superdrug's Terms of Service. In most juri
 
 ## Install
 
-Requires Python 3.10+.
+Requires Python 3.10+ and (for option 2) Google Chrome installed normally on your computer.
 
 ```bash
 python -m venv .venv
@@ -78,43 +58,40 @@ python -m playwright install chromium
 python superdrug_report.py
 ```
 
-It will prompt for:
+You'll see the numbered menu. Pick a number and follow the on-screen prompts. The report appears under `reports/` once the run completes.
 
+### Skip the menu
+
+If you want to wire this into a script, you can pass `--mode N` to skip the menu, or set the environment variable `SUPERDRUG_REPORT_MODE=N`:
+
+```bash
+python superdrug_report.py --mode 1                          # auto-login
+python superdrug_report.py --mode 2                          # open Chrome for me
+SUPERDRUG_REPORT_MODE=4 python superdrug_report.py           # cached only
 ```
-Superdrug email: you@example.com
-Password (input hidden):
-```
 
-Then it logs in silently in a hidden browser, walks through your account pages, and writes the report under `reports/`.
-
-### Non-interactive use
+For non-interactive auto-login (e.g. cron):
 
 ```bash
 SUPERDRUG_EMAIL='you@example.com' \
 SUPERDRUG_PASSWORD='hunter2'      \
-python superdrug_report.py
-```
-
-or with flags + a different env var name for the password:
-
-```bash
-python superdrug_report.py --email you@example.com --password-from-env MY_SD_PW
+python superdrug_report.py --mode 1
 ```
 
 ### Flags
 
+Most users won't need any of these — pick a number from the menu and you're done.
+
 | Flag | What it does |
 |------|--------------|
-| `--email EMAIL` | Account email (otherwise prompted). |
-| `--password-from-env VAR` | Read the password from this environment variable instead of prompting. Default falls back to `SUPERDRUG_PASSWORD`. |
+| `--mode {1,2,3,4}` | Skip the interactive menu and go straight to a mode. |
+| `--email EMAIL` | Use this email instead of asking. |
+| `--password-from-env VAR` | Read the password from this environment variable instead of prompting. Default fallback is `SUPERDRUG_PASSWORD`. |
 | `--output DIR` | Where to write the report (default `reports/`). |
 | `--debug` | Also save raw HTML / visible text of each page under `<output>/debug/`. |
-| `--show-browser` | Run the browser visibly. Useful if Superdrug is repeatedly CAPTCHA-ing you. |
-| `--manual-login` | Open a visible browser and let you sign in yourself — no email/password prompts. |
-| `--use-my-chrome` | Connect to your own already-running Chrome (`--remote-debugging-port=9222`). Most reliable mode if Superdrug is bot-blocking. |
-| `--cdp-url URL` | Where to find your running Chrome's debug endpoint (default `http://localhost:9222`). |
 | `--no-cache` | Ignore cached browser state; start fresh. |
-| `--state-dir DIR` | Where to persist browser profile data (default `.browser_state/`). |
+| `--state-dir DIR` | Where to persist Playwright browser profile data (default `.browser_state/`). |
+| `--cdp-url URL` | For mode 2: where the launched Chrome's debug endpoint listens (default `http://localhost:9222`). |
 
 ## Report sections
 
@@ -132,23 +109,7 @@ If any section can't be parsed into structured fields, the tool falls back to du
 
 ## Troubleshooting
 
-- **"CAPTCHA / 2FA detected — opening a visible browser window"** — solve the challenge in the window, press Enter; the session is cached so subsequent runs go straight through.
-- **"Login rejected — email/password didn't work"** — re-check the credentials. Superdrug normally locks the account after a few wrong attempts; if so, reset the password on their site first.
-- **Page didn't load / selector missing** — Superdrug may have changed a layout. Rerun with `--debug` to save the raw HTML of each page under `reports/debug/`.
-- **Repeatedly being challenged on every run** — try `--show-browser` once, solve the CAPTCHA, then later runs can go back to hidden mode using the cached `.browser_state/`.
-
-## Files
-
-```
-superdrug_report.py    # entrypoint: credentials, auto-login, scraper orchestration, report write-out
-report.py              # turns the collected data dict into a neat .txt
-scrapers/
-  __init__.py
-  base.py              # shared helpers (safe_goto, extract_fields, dump_visible_text)
-  profile.py
-  beautycard.py
-  addresses.py
-  payments.py
-  orders.py
-  subscriptions.py
-```
+- **"Couldn't auto-login — Superdrug looks like it's flagging the script."** Akamai's bot detector is having a moment. Pick option 2 from the menu next time — that uses your real Chrome and is essentially undetectable.
+- **"Couldn't find a Chrome / Chromium installation."** (Mode 2) Install Google Chrome from <https://www.google.com/chrome/>.
+- **No cached session found.** (Mode 4) Run option 1, 2 or 3 once to sign in; the cookies are then cached under `.browser_state/` (or, for mode 2, under `~/.cache/superdrug-report-chrome/`).
+- **Order history report is empty.** Make sure you have at least one order on the account; new accounts show no history.
