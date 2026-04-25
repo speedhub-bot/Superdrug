@@ -38,11 +38,23 @@ ACCOUNT_URL = "https://www.superdrug.com/my-account"
 HERE = Path(__file__).resolve().parent
 DEFAULT_STATE_DIR = HERE / ".browser_state"
 DEFAULT_OUTPUT_DIR = HERE / "reports"
+DEFAULT_CDP_URL = "http://localhost:9222"
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+# Tiny init script that hides the most obvious automation tells. This is NOT a
+# CAPTCHA bypass / fingerprint randomiser — it just stops `navigator.webdriver`
+# from screaming "I'm a bot" at every site we visit. Without this, sites like
+# Cloudflare-fronted Superdrug throw their challenge page at us instantly.
+_STEALTH_INIT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-GB', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = window.chrome || { runtime: {} };
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +86,21 @@ def parse_args() -> argparse.Namespace:
         "--manual-login",
         action="store_true",
         help="Skip automatic form-fill — open a visible browser and let you sign in yourself.",
+    )
+    p.add_argument(
+        "--use-my-chrome",
+        action="store_true",
+        help=(
+            "Connect to your own already-running Chrome instead of launching one. "
+            "Start Chrome yourself with `--remote-debugging-port=9222`, sign in to "
+            "Superdrug like a human, then run with this flag. Bulletproof against "
+            "bot detection because it literally is your real browser."
+        ),
+    )
+    p.add_argument(
+        "--cdp-url",
+        default=DEFAULT_CDP_URL,
+        help=f"Where to find your running Chrome's debug endpoint (default: {DEFAULT_CDP_URL}).",
     )
     p.add_argument("--no-cache", action="store_true",
                    help="Don't reuse cached browser state; start fresh.")
@@ -156,16 +183,53 @@ def open_context(pw, args: argparse.Namespace, *, headless: bool) -> BrowserCont
         state_dir = state_dir.with_name(state_dir.name + "-fresh")
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    return pw.chromium.launch_persistent_context(
+    launch_kwargs = dict(
         user_data_dir=str(state_dir),
         headless=headless,
         viewport={"width": 1280, "height": 900},
         user_agent=USER_AGENT,
+        locale="en-GB",
+        timezone_id="Europe/London",
+        extra_http_headers={
+            "Accept-Language": "en-GB,en;q=0.9",
+            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Linux"',
+        },
         args=[
             "--disable-blink-features=AutomationControlled",
             "--disable-features=IsolateOrigins,site-per-process",
+            "--no-default-browser-check",
+            "--no-first-run",
         ],
     )
+
+    # Prefer real Chrome over Playwright's bundled Chromium — much harder for
+    # Cloudflare/Akamai to fingerprint. Fall back to bundled Chromium if Chrome
+    # isn't installed on this machine.
+    try:
+        ctx = pw.chromium.launch_persistent_context(channel="chrome", **launch_kwargs)
+    except Exception:
+        ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
+
+    ctx.add_init_script(_STEALTH_INIT)
+    return ctx
+
+
+def connect_to_my_chrome(pw, cdp_url: str) -> BrowserContext:
+    """Attach to the user's already-running Chrome instead of launching one."""
+    browser = pw.chromium.connect_over_cdp(cdp_url)
+    if browser.contexts:
+        ctx = browser.contexts[0]
+    else:
+        ctx = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=USER_AGENT,
+            locale="en-GB",
+            timezone_id="Europe/London",
+        )
+    ctx.add_init_script(_STEALTH_INIT)
+    return ctx
 
 
 def _dismiss_cookie_banner(page: Page) -> None:
@@ -320,10 +384,12 @@ def attempt_auto_login(page: Page, email: str, password: str) -> str:
     return "unknown"
 
 
-def manual_login_loop(ctx: BrowserContext, page: Page) -> bool:
+def manual_login_loop(ctx: BrowserContext, page: Page, *, reason: str = "") -> bool:
     """Visible-browser fallback: ask the owner to log in / solve CAPTCHA themselves."""
     print()
-    warn("CAPTCHA / 2FA detected — opening a visible browser window so you can solve it.")
+    if reason:
+        warn(reason)
+    warn("Opening a visible browser window so you can sign in (and solve any challenge) yourself.")
     print("        After you're on the account dashboard, come back here and press Enter.")
     print()
     with contextlib.suppress(Exception):
@@ -364,7 +430,10 @@ def detect_email(page: Page, fallback: str) -> str:
 def run() -> int:
     args = parse_args()
 
-    if args.manual_login:
+    if args.use_my_chrome:
+        email = args.email or input("Superdrug email (for the report header): ").strip()
+        password = ""
+    elif args.manual_login:
         # Manual mode: skip prompting for password, open a visible browser.
         email = args.email or input("Superdrug email (for the report header): ").strip()
         password = ""
@@ -376,15 +445,40 @@ def run() -> int:
 
     banner(email)
 
-    headless = not args.show_browser and not args.manual_login
+    headless = not args.show_browser and not args.manual_login and not args.use_my_chrome
 
     with sync_playwright() as pw:
-        ctx = open_context(pw, args, headless=headless)
+        if args.use_my_chrome:
+            step(f"Connecting to your Chrome at {args.cdp_url}...")
+            try:
+                ctx = connect_to_my_chrome(pw, args.cdp_url)
+            except Exception as e:
+                fail(f"Could not connect: {e}")
+                print(
+                    "        Start Chrome first with:\n"
+                    "          google-chrome --remote-debugging-port=9222\n"
+                    "        then sign in to https://www.superdrug.com and rerun."
+                )
+                return 1
+            ok("Connected.")
+        else:
+            ctx = open_context(pw, args, headless=headless)
         try:
             page = ctx.new_page()
 
             # ---- Login phase ----
-            if args.manual_login:
+            if args.use_my_chrome:
+                step("Loading account dashboard...")
+                with contextlib.suppress(Exception):
+                    page.goto(ACCOUNT_URL, wait_until="domcontentloaded", timeout=20_000)
+                if not _is_logged_in(page):
+                    fail(
+                        "Your Chrome doesn't appear to be signed into Superdrug. "
+                        "Sign in there first, then rerun."
+                    )
+                    return 1
+                ok("Already signed in.")
+            elif args.manual_login:
                 step("Opening browser for manual login...")
                 if not manual_login_loop(ctx, page):
                     fail("Login was not completed. Aborting.")
@@ -398,27 +492,29 @@ def run() -> int:
 
                 if status == "ok":
                     ok(f"Logged in ({elapsed:.1f}s).")
-                elif status == "captcha":
-                    # Reopen visibly and let the owner solve.
-                    with contextlib.suppress(Exception):
-                        ctx.close()
-                    ctx = open_context(pw, args, headless=False)
-                    page = ctx.new_page()
-                    if not manual_login_loop(ctx, page):
-                        fail("Login was not completed. Aborting.")
-                        return 1
-                    ok("Logged in.")
                 elif status == "bad_creds":
                     fail("Login rejected — email/password didn't work.")
                     return 1
                 else:
-                    warn("Couldn't confirm login state automatically.")
-                    print("        Falling back to a visible browser window.")
+                    if status == "captcha":
+                        reason = "CAPTCHA / bot-challenge detected."
+                    else:
+                        reason = (
+                            "Couldn't auto-login — Superdrug may be flagging the script as a bot."
+                        )
+                    print()
+                    warn(reason)
+                    print(
+                        "        TIP: the most reliable way to run this tool is\n"
+                        "             `--use-my-chrome` (start your own Chrome with\n"
+                        "             `--remote-debugging-port=9222`, sign in normally,\n"
+                        "             then rerun this script with that flag)."
+                    )
                     with contextlib.suppress(Exception):
                         ctx.close()
                     ctx = open_context(pw, args, headless=False)
                     page = ctx.new_page()
-                    if not manual_login_loop(ctx, page):
+                    if not manual_login_loop(ctx, page, reason=""):
                         fail("Login was not completed. Aborting.")
                         return 1
                     ok("Logged in.")

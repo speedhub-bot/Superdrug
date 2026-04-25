@@ -33,6 +33,21 @@ By default it runs in a hidden (headless) browser and asks you for your email an
 
 If Superdrug shows a CAPTCHA or 2FA challenge during login, the tool **automatically reopens the browser visibly** and asks you to solve it in the window — once.
 
+### If Superdrug keeps blocking the script
+
+Superdrug runs Akamai bot detection. Even with realistic User-Agent / `navigator.webdriver` patches, Akamai sometimes still flags Playwright's launched Chromium and refuses to let it sign in. **The bulletproof workaround is `--use-my-chrome`:** you start your own normal Chrome with a debug port, sign in to Superdrug like a human, then point the tool at it. Akamai sees a real human session because it *is* one.
+
+```bash
+# Terminal 1
+google-chrome --remote-debugging-port=9222
+# Sign in to https://www.superdrug.com normally in that window
+
+# Terminal 2
+python superdrug_report.py --use-my-chrome
+```
+
+No password prompt at all — the script just borrows your browser's already-authenticated session, scrapes, and exits. Your real Chrome window stays open and untouched.
+
 ## Intended use
 
 **Your own account, one at a time.** There is deliberately:
@@ -96,6 +111,8 @@ python superdrug_report.py --email you@example.com --password-from-env MY_SD_PW
 | `--debug` | Also save raw HTML / visible text of each page under `<output>/debug/`. |
 | `--show-browser` | Run the browser visibly. Useful if Superdrug is repeatedly CAPTCHA-ing you. |
 | `--manual-login` | Open a visible browser and let you sign in yourself — no email/password prompts. |
+| `--use-my-chrome` | Connect to your own already-running Chrome (`--remote-debugging-port=9222`). Most reliable mode if Superdrug is bot-blocking. |
+| `--cdp-url URL` | Where to find your running Chrome's debug endpoint (default `http://localhost:9222`). |
 | `--no-cache` | Ignore cached browser state; start fresh. |
 | `--state-dir DIR` | Where to persist browser profile data (default `.browser_state/`). |
 
