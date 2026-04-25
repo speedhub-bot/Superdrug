@@ -22,12 +22,15 @@ import contextlib
 import getpass
 import os
 import re
+import shutil
+import socket
+import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-from playwright.sync_api import BrowserContext, Page, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PWTimeout
 
 import report
@@ -45,15 +48,64 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-# Tiny init script that hides the most obvious automation tells. This is NOT a
-# CAPTCHA bypass / fingerprint randomiser — it just stops `navigator.webdriver`
-# from screaming "I'm a bot" at every site we visit. Without this, sites like
-# Cloudflare-fronted Superdrug throw their challenge page at us instantly.
-_STEALTH_INIT = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-GB', 'en']});
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-window.chrome = window.chrome || { runtime: {} };
+# Init script that makes Playwright's launched browser look like an everyday
+# Chrome session. This is *not* a CAPTCHA bypass / fingerprint randomiser — it
+# just removes the dead-giveaway markers (`navigator.webdriver`, missing
+# `window.chrome`, empty plugin list, etc.) that Cloudflare/Akamai use to
+# instantly throw a challenge page at us. Same logic that any anti-bot tutorial
+# describes; expressed inline so we don't pull in another dependency.
+_STEALTH_INIT = r"""
+(() => {
+    try {
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    } catch (e) {}
+    try {
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-GB', 'en']});
+    } catch (e) {}
+    try {
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [
+                {name: 'PDF Viewer', filename: 'internal-pdf-viewer'},
+                {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer'},
+                {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer'},
+                {name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer'},
+                {name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer'},
+            ],
+        });
+    } catch (e) {}
+    try {
+        Object.defineProperty(navigator, 'mimeTypes', {get: () => [{type: 'application/pdf'}]});
+    } catch (e) {}
+    try {
+        Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+    } catch (e) {}
+    try {
+        Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+    } catch (e) {}
+    window.chrome = window.chrome || {};
+    window.chrome.runtime = window.chrome.runtime || {};
+    window.chrome.app = window.chrome.app || {InstallState: {}, RunningState: {}, getDetails: () => ({}), getIsInstalled: () => false};
+    window.chrome.csi = window.chrome.csi || function () {};
+    window.chrome.loadTimes = window.chrome.loadTimes || function () { return {}; };
+    if (navigator.permissions && navigator.permissions.query) {
+        const original = navigator.permissions.query.bind(navigator.permissions);
+        navigator.permissions.query = (p) =>
+            (p && p.name === 'notifications')
+                ? Promise.resolve({state: Notification.permission || 'default', onchange: null})
+                : original(p);
+    }
+    try {
+        const proto = WebGLRenderingContext && WebGLRenderingContext.prototype;
+        if (proto) {
+            const orig = proto.getParameter;
+            proto.getParameter = function (p) {
+                if (p === 37445) return 'Intel Inc.';                  // UNMASKED_VENDOR_WEBGL
+                if (p === 37446) return 'Intel Iris OpenGL Engine';    // UNMASKED_RENDERER_WEBGL
+                return orig.call(this, p);
+            };
+        }
+    } catch (e) {}
+})();
 """
 
 
@@ -62,10 +114,25 @@ window.chrome = window.chrome || { runtime: {} };
 # ---------------------------------------------------------------------------
 
 
+MODE_AUTO = 1          # type email + password, hidden browser
+MODE_OPEN_CHROME = 2   # script launches your real Chrome, you sign in there
+MODE_VISIBLE = 3       # visible browser, you sign in by hand
+MODE_CACHED = 4        # reuse cached session, no login at all
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--mode",
+        type=int,
+        choices=[1, 2, 3, 4],
+        help=(
+            "Skip the interactive menu and pick a mode directly: "
+            "1=auto-login, 2=open my Chrome, 3=visible browser, 4=cached session."
+        ),
     )
     p.add_argument("--email", help="Account email. Prompts interactively if omitted.")
     p.add_argument(
@@ -77,36 +144,43 @@ def parse_args() -> argparse.Namespace:
                    help="Directory to write the .txt report into (default: ./reports)")
     p.add_argument("--debug", action="store_true",
                    help="Save raw HTML/text of each visited page under <output>/debug/.")
-    p.add_argument(
-        "--show-browser",
-        action="store_true",
-        help="Show the browser window (default: hidden). Useful if Superdrug throws a CAPTCHA.",
-    )
-    p.add_argument(
-        "--manual-login",
-        action="store_true",
-        help="Skip automatic form-fill — open a visible browser and let you sign in yourself.",
-    )
-    p.add_argument(
-        "--use-my-chrome",
-        action="store_true",
-        help=(
-            "Connect to your own already-running Chrome instead of launching one. "
-            "Start Chrome yourself with `--remote-debugging-port=9222`, sign in to "
-            "Superdrug like a human, then run with this flag. Bulletproof against "
-            "bot detection because it literally is your real browser."
-        ),
-    )
-    p.add_argument(
-        "--cdp-url",
-        default=DEFAULT_CDP_URL,
-        help=f"Where to find your running Chrome's debug endpoint (default: {DEFAULT_CDP_URL}).",
-    )
     p.add_argument("--no-cache", action="store_true",
                    help="Don't reuse cached browser state; start fresh.")
     p.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR,
                    help=f"Where to persist browser profile data (default: {DEFAULT_STATE_DIR}).")
+    p.add_argument(
+        "--cdp-url",
+        default=DEFAULT_CDP_URL,
+        help=f"For mode 2: where the launched Chrome's debug endpoint listens (default: {DEFAULT_CDP_URL}).",
+    )
     return p.parse_args()
+
+
+def interactive_menu() -> int:
+    print()
+    print("=" * 60)
+    print("  Superdrug Account Report")
+    print("=" * 60)
+    print("  How would you like to sign in?")
+    print()
+    print("    1) Type my email + password   (silent / hidden browser, fast")
+    print("                                   — may fail if Superdrug bot-blocks)")
+    print("    2) Open Chrome for me          [most reliable]")
+    print("                                   I open your real Chrome, you sign in there.")
+    print("    3) Open a visible browser      Plays in front of you; sign in by hand.")
+    print("    4) Use cached session          Skip login if I've signed in before.")
+    print("    5) Quit")
+    print()
+    while True:
+        try:
+            choice = input("  Pick [1-5]: ").strip()
+        except EOFError:
+            return 5
+        if choice in {"1", "2", "3", "4"}:
+            return int(choice)
+        if choice == "5" or choice.lower() in {"q", "quit", "exit"}:
+            return 5
+        print(f"    '{choice}' isn't 1-5. Try again.")
 
 
 def get_credentials(args: argparse.Namespace) -> tuple[str, str]:
@@ -196,11 +270,14 @@ def open_context(pw, args: argparse.Namespace, *, headless: bool) -> BrowserCont
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Linux"',
         },
+        ignore_default_args=["--enable-automation"],
         args=[
             "--disable-blink-features=AutomationControlled",
             "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
             "--no-default-browser-check",
             "--no-first-run",
+            "--no-sandbox",
         ],
     )
 
@@ -216,8 +293,106 @@ def open_context(pw, args: argparse.Namespace, *, headless: bool) -> BrowserCont
     return ctx
 
 
-def connect_to_my_chrome(pw, cdp_url: str) -> BrowserContext:
-    """Attach to the user's already-running Chrome instead of launching one."""
+# ---------------------------------------------------------------------------
+# Mode 2: launch the user's real Chrome ourselves and attach to it
+# ---------------------------------------------------------------------------
+
+
+def _find_chrome_binary() -> str | None:
+    """Locate the user's installed Chrome / Chromium binary, cross-platform."""
+    if sys.platform == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        ]
+    elif sys.platform.startswith("win"):
+        program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        program_files_x86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            rf"{program_files}\Google\Chrome\Application\chrome.exe",
+            rf"{program_files_x86}\Google\Chrome\Application\chrome.exe",
+            rf"{local_app}\Google\Chrome\Application\chrome.exe" if local_app else "",
+            rf"{program_files}\Chromium\Application\chrome.exe",
+        ]
+    else:
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+            "/opt/google/chrome/chrome",
+        ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        p = shutil.which(name)
+        if p:
+            return p
+    return None
+
+
+def _wait_for_port(host: str, port: int, timeout: float = 20.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with contextlib.suppress(Exception), socket.create_connection((host, port), timeout=1.0):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def launch_user_chrome(args: argparse.Namespace) -> tuple[subprocess.Popen | None, str]:
+    """Launch the user's real Chrome with a debug port and a tool-specific profile.
+
+    Returns (popen_handle, cdp_url). The handle is None if Chrome was already
+    running on the requested port — in that case we just attach to it.
+    """
+    cdp_url = args.cdp_url or DEFAULT_CDP_URL
+    port = int(cdp_url.rsplit(":", 1)[-1].rstrip("/"))
+
+    # Already running on that port? Just attach.
+    if _wait_for_port("localhost", port, timeout=0.5):
+        return None, cdp_url
+
+    chrome_bin = _find_chrome_binary()
+    if not chrome_bin:
+        raise RuntimeError(
+            "Couldn't find a Chrome / Chromium installation. "
+            "Install Google Chrome from https://www.google.com/chrome/ then rerun."
+        )
+
+    profile_dir = Path.home() / ".cache" / "superdrug-report-chrome"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    chrome_args = [
+        chrome_bin,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-default-browser-check",
+        "--no-first-run",
+        "--start-maximized",
+        LOGIN_URL,
+    ]
+    proc = subprocess.Popen(  # noqa: S603 — chrome_bin is from a fixed allowlist
+        chrome_args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if not _wait_for_port("localhost", port, timeout=20.0):
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        raise RuntimeError(
+            f"Chrome started but didn't open a debug port on {port} within 20s."
+        )
+    return proc, cdp_url
+
+
+def connect_to_chrome(pw, cdp_url: str) -> tuple[Browser, BrowserContext]:
+    """Attach to a Chrome instance speaking CDP at cdp_url."""
     browser = pw.chromium.connect_over_cdp(cdp_url)
     if browser.contexts:
         ctx = browser.contexts[0]
@@ -229,7 +404,7 @@ def connect_to_my_chrome(pw, cdp_url: str) -> BrowserContext:
             timezone_id="Europe/London",
         )
     ctx.add_init_script(_STEALTH_INIT)
-    return ctx
+    return browser, ctx
 
 
 def _dismiss_cookie_banner(page: Page) -> None:
@@ -427,64 +602,127 @@ def detect_email(page: Page, fallback: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _mode_label(mode: int) -> str:
+    return {
+        MODE_AUTO: "auto-login",
+        MODE_OPEN_CHROME: "open my Chrome",
+        MODE_VISIBLE: "visible browser",
+        MODE_CACHED: "cached session",
+    }.get(mode, "?")
+
+
+def _resolve_mode(args: argparse.Namespace) -> int:
+    """Pick a login mode: from --mode flag, from env var, or via the menu."""
+    if args.mode is not None:
+        return args.mode
+    env_mode = os.environ.get("SUPERDRUG_REPORT_MODE", "").strip()
+    if env_mode in {"1", "2", "3", "4"}:
+        return int(env_mode)
+    # If the user piped non-interactive credentials via env, default to mode 1
+    # so non-interactive scripted use still works.
+    if os.environ.get("SUPERDRUG_EMAIL") and os.environ.get("SUPERDRUG_PASSWORD"):
+        return MODE_AUTO
+    if not sys.stdin.isatty():
+        # No TTY and no env override \u2014 fall back to mode 1 (will read from env / fail).
+        return MODE_AUTO
+    return interactive_menu()
+
+
 def run() -> int:
     args = parse_args()
+    mode = _resolve_mode(args)
+    if mode == 5 or mode not in {MODE_AUTO, MODE_OPEN_CHROME, MODE_VISIBLE, MODE_CACHED}:
+        print("  Bye.")
+        return 0
 
-    if args.use_my_chrome:
-        email = args.email or input("Superdrug email (for the report header): ").strip()
-        password = ""
-    elif args.manual_login:
-        # Manual mode: skip prompting for password, open a visible browser.
-        email = args.email or input("Superdrug email (for the report header): ").strip()
-        password = ""
-    else:
+    # Resolve email + password depending on mode.
+    if mode == MODE_AUTO:
         email, password = get_credentials(args)
+    else:
+        # Modes 2/3/4 don't need the password (you sign in yourself or use cache).
+        email = args.email or os.environ.get("SUPERDRUG_EMAIL", "").strip()
+        if not email:
+            try:
+                email = input("Superdrug email (for the report header): ").strip()
+            except EOFError:
+                email = ""
+        password = ""
 
     args.output.mkdir(parents=True, exist_ok=True)
     debug_dir = (args.output / "debug") if args.debug else None
 
-    banner(email)
+    banner(email or "(unknown)")
+    print(f"  Mode    : {mode} ({_mode_label(mode)})")
+    _line()
 
-    headless = not args.show_browser and not args.manual_login and not args.use_my_chrome
+    chrome_proc: subprocess.Popen | None = None
+    cdp_browser: Browser | None = None
 
     with sync_playwright() as pw:
-        if args.use_my_chrome:
-            step(f"Connecting to your Chrome at {args.cdp_url}...")
+        # ---- Open / connect browser ----
+        if mode == MODE_OPEN_CHROME:
+            step("Opening Chrome for you...")
             try:
-                ctx = connect_to_my_chrome(pw, args.cdp_url)
-            except Exception as e:
-                fail(f"Could not connect: {e}")
-                print(
-                    "        Start Chrome first with:\n"
-                    "          google-chrome --remote-debugging-port=9222\n"
-                    "        then sign in to https://www.superdrug.com and rerun."
-                )
+                chrome_proc, cdp_url = launch_user_chrome(args)
+            except RuntimeError as e:
+                fail(str(e))
                 return 1
-            ok("Connected.")
-        else:
-            ctx = open_context(pw, args, headless=headless)
+            if chrome_proc is None:
+                ok(f"Attached to a Chrome already running on {cdp_url}.")
+            else:
+                ok(f"Chrome is open with a Superdrug login tab. ({cdp_url})")
+            try:
+                cdp_browser, ctx = connect_to_chrome(pw, cdp_url)
+            except Exception as e:
+                fail(f"Could not connect to Chrome: {e}")
+                return 1
+        elif mode == MODE_VISIBLE:
+            ctx = open_context(pw, args, headless=False)
+        elif mode == MODE_CACHED:
+            ctx = open_context(pw, args, headless=True)
+        else:  # MODE_AUTO
+            ctx = open_context(pw, args, headless=True)
+
         try:
-            page = ctx.new_page()
+            # Reuse an existing tab if Chrome already had one open; otherwise new.
+            page = ctx.pages[0] if (mode == MODE_OPEN_CHROME and ctx.pages) else ctx.new_page()
 
             # ---- Login phase ----
-            if args.use_my_chrome:
-                step("Loading account dashboard...")
+            if mode == MODE_OPEN_CHROME:
+                with contextlib.suppress(Exception):
+                    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=15_000)
+                print()
+                step("Sign in to Superdrug in the Chrome window I just opened.")
+                print("        When you see your account dashboard, come back here and press Enter.")
+                print()
+                try:
+                    input("  Press Enter once you're signed in... ")
+                except (EOFError, KeyboardInterrupt):
+                    fail("Login was not completed. Aborting.")
+                    return 1
                 with contextlib.suppress(Exception):
                     page.goto(ACCOUNT_URL, wait_until="domcontentloaded", timeout=20_000)
                 if not _is_logged_in(page):
-                    fail(
-                        "Your Chrome doesn't appear to be signed into Superdrug. "
-                        "Sign in there first, then rerun."
-                    )
+                    fail("Doesn't look like you're signed in yet. Aborting.")
                     return 1
-                ok("Already signed in.")
-            elif args.manual_login:
+                ok("Signed in.")
+            elif mode == MODE_VISIBLE:
                 step("Opening browser for manual login...")
                 if not manual_login_loop(ctx, page):
                     fail("Login was not completed. Aborting.")
                     return 1
                 ok("Logged in.")
-            else:
+            elif mode == MODE_CACHED:
+                step("Loading account dashboard from cached session...")
+                with contextlib.suppress(Exception):
+                    page.goto(ACCOUNT_URL, wait_until="domcontentloaded", timeout=20_000)
+                if not _is_logged_in(page):
+                    fail(
+                        "No cached session found. Run with mode 1 or 3 first to sign in once."
+                    )
+                    return 1
+                ok("Cached session is valid.")
+            else:  # MODE_AUTO
                 step("Logging in...")
                 t0 = time.time()
                 status = attempt_auto_login(page, email, password)
@@ -493,22 +731,20 @@ def run() -> int:
                 if status == "ok":
                     ok(f"Logged in ({elapsed:.1f}s).")
                 elif status == "bad_creds":
-                    fail("Login rejected — email/password didn't work.")
+                    fail("Login rejected \u2014 email/password didn't work.")
                     return 1
                 else:
                     if status == "captcha":
                         reason = "CAPTCHA / bot-challenge detected."
                     else:
                         reason = (
-                            "Couldn't auto-login — Superdrug may be flagging the script as a bot."
+                            "Couldn't auto-login \u2014 Superdrug looks like it's flagging the script."
                         )
                     print()
                     warn(reason)
                     print(
-                        "        TIP: the most reliable way to run this tool is\n"
-                        "             `--use-my-chrome` (start your own Chrome with\n"
-                        "             `--remote-debugging-port=9222`, sign in normally,\n"
-                        "             then rerun this script with that flag)."
+                        "        TIP: rerun and pick option 2 (\"Open Chrome for me\")\n"
+                        "             \u2014 it's the most reliable mode against bot detection."
                     )
                     with contextlib.suppress(Exception):
                         ctx.close()
@@ -551,8 +787,18 @@ def run() -> int:
                 "sections": sections,
             }
         finally:
-            with contextlib.suppress(Exception):
-                ctx.close()
+            if mode == MODE_OPEN_CHROME:
+                # Leave the user's Chrome window alone — disconnect cleanly.
+                if cdp_browser is not None:
+                    with contextlib.suppress(Exception):
+                        cdp_browser.close()
+            else:
+                with contextlib.suppress(Exception):
+                    ctx.close()
+    # The launched-Chrome subprocess is intentionally left running so the user
+    # can keep using the same Chrome window for future runs (and so we keep the
+    # cached login session).
+    _ = chrome_proc
 
     # ---- Render phase ----
     text = report.render(collected)
