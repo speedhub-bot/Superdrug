@@ -718,7 +718,7 @@ def run() -> int:
                     page.goto(ACCOUNT_URL, wait_until="domcontentloaded", timeout=20_000)
                 if not _is_logged_in(page):
                     fail(
-                        "No cached session found. Run with mode 1, 2 or 3 first to sign in once."
+                        "No cached session found. Run with mode 1 or 3 first to sign in once."
                     )
                     return 1
                 ok("Cached session is valid.")
