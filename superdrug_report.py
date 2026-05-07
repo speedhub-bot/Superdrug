@@ -34,6 +34,16 @@ from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PWTimeout
 
 import report
+from akamai import (
+    EXTRA_HEADERS,
+    LAUNCH_ARGS,
+    BypassConfig,
+    ChallengeStatus,
+    apply_stealth,
+    is_challenge,
+)
+from akamai.sensor import warm_up
+from akamai.stealth import IGNORE_DEFAULT_ARGS
 from scrapers import ALL_SCRAPERS
 
 LOGIN_URL = "https://www.superdrug.com/login"
@@ -43,70 +53,10 @@ DEFAULT_STATE_DIR = HERE / ".browser_state"
 DEFAULT_OUTPUT_DIR = HERE / "reports"
 DEFAULT_CDP_URL = "http://localhost:9222"
 
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-
-# Init script that makes Playwright's launched browser look like an everyday
-# Chrome session. This is *not* a CAPTCHA bypass / fingerprint randomiser — it
-# just removes the dead-giveaway markers (`navigator.webdriver`, missing
-# `window.chrome`, empty plugin list, etc.) that Cloudflare/Akamai use to
-# instantly throw a challenge page at us. Same logic that any anti-bot tutorial
-# describes; expressed inline so we don't pull in another dependency.
-_STEALTH_INIT = r"""
-(() => {
-    try {
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    } catch (e) {}
-    try {
-        Object.defineProperty(navigator, 'languages', {get: () => ['en-GB', 'en']});
-    } catch (e) {}
-    try {
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [
-                {name: 'PDF Viewer', filename: 'internal-pdf-viewer'},
-                {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer'},
-                {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer'},
-                {name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer'},
-                {name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer'},
-            ],
-        });
-    } catch (e) {}
-    try {
-        Object.defineProperty(navigator, 'mimeTypes', {get: () => [{type: 'application/pdf'}]});
-    } catch (e) {}
-    try {
-        Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
-    } catch (e) {}
-    try {
-        Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-    } catch (e) {}
-    window.chrome = window.chrome || {};
-    window.chrome.runtime = window.chrome.runtime || {};
-    window.chrome.app = window.chrome.app || {InstallState: {}, RunningState: {}, getDetails: () => ({}), getIsInstalled: () => false};
-    window.chrome.csi = window.chrome.csi || function () {};
-    window.chrome.loadTimes = window.chrome.loadTimes || function () { return {}; };
-    if (navigator.permissions && navigator.permissions.query) {
-        const original = navigator.permissions.query.bind(navigator.permissions);
-        navigator.permissions.query = (p) =>
-            (p && p.name === 'notifications')
-                ? Promise.resolve({state: Notification.permission || 'default', onchange: null})
-                : original(p);
-    }
-    try {
-        const proto = WebGLRenderingContext && WebGLRenderingContext.prototype;
-        if (proto) {
-            const orig = proto.getParameter;
-            proto.getParameter = function (p) {
-                if (p === 37445) return 'Intel Inc.';                  // UNMASKED_VENDOR_WEBGL
-                if (p === 37446) return 'Intel Iris OpenGL Engine';    // UNMASKED_RENDERER_WEBGL
-                return orig.call(this, p);
-            };
-        }
-    } catch (e) {}
-})();
-"""
+# Default tunables: Chrome 131 / Linux / en-GB. Edit fields here if you want
+# to spoof a different browser identity globally.
+AKAMAI_CFG = BypassConfig()
+USER_AGENT = AKAMAI_CFG.user_agent
 
 
 # ---------------------------------------------------------------------------
@@ -260,25 +210,16 @@ def open_context(pw, args: argparse.Namespace, *, headless: bool) -> BrowserCont
     launch_kwargs = dict(
         user_data_dir=str(state_dir),
         headless=headless,
-        viewport={"width": 1280, "height": 900},
-        user_agent=USER_AGENT,
-        locale="en-GB",
-        timezone_id="Europe/London",
-        extra_http_headers={
-            "Accept-Language": "en-GB,en;q=0.9",
-            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Linux"',
+        viewport={
+            "width": AKAMAI_CFG.viewport.width,
+            "height": AKAMAI_CFG.viewport.height,
         },
-        ignore_default_args=["--enable-automation"],
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--disable-site-isolation-trials",
-            "--no-default-browser-check",
-            "--no-first-run",
-            "--no-sandbox",
-        ],
+        user_agent=USER_AGENT,
+        locale=AKAMAI_CFG.locale,
+        timezone_id=AKAMAI_CFG.timezone_id,
+        extra_http_headers=dict(EXTRA_HEADERS),
+        ignore_default_args=list(IGNORE_DEFAULT_ARGS),
+        args=list(LAUNCH_ARGS),
     )
 
     # Prefer real Chrome over Playwright's bundled Chromium — much harder for
@@ -289,7 +230,7 @@ def open_context(pw, args: argparse.Namespace, *, headless: bool) -> BrowserCont
     except Exception:
         ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
 
-    ctx.add_init_script(_STEALTH_INIT)
+    apply_stealth(ctx, AKAMAI_CFG)
     return ctx
 
 
@@ -398,12 +339,15 @@ def connect_to_chrome(pw, cdp_url: str) -> tuple[Browser, BrowserContext]:
         ctx = browser.contexts[0]
     else:
         ctx = browser.new_context(
-            viewport={"width": 1280, "height": 900},
+            viewport={
+                "width": AKAMAI_CFG.viewport.width,
+                "height": AKAMAI_CFG.viewport.height,
+            },
             user_agent=USER_AGENT,
-            locale="en-GB",
-            timezone_id="Europe/London",
+            locale=AKAMAI_CFG.locale,
+            timezone_id=AKAMAI_CFG.timezone_id,
         )
-    ctx.add_init_script(_STEALTH_INIT)
+    apply_stealth(ctx, AKAMAI_CFG)
     return browser, ctx
 
 
@@ -425,33 +369,13 @@ def _dismiss_cookie_banner(page: Page) -> None:
 
 
 def _is_captcha(page: Page) -> bool:
-    """Best-effort detection of CAPTCHA / Cloudflare / bot-challenge pages."""
-    url = page.url.lower()
-    if any(s in url for s in ("captcha", "challenges.cloudflare", "/cdn-cgi/challenge")):
-        return True
-    body = page.query_selector("body")
-    text = (body.inner_text() if body else "").lower() if body else ""
-    needles = (
-        "verify you are human",
-        "i'm not a robot",
-        "checking your browser",
-        "complete the security check",
-        "press and hold",
-        "needs to review the security",
-        "captcha",
-    )
-    if any(n in text for n in needles):
-        return True
-    for sel in (
-        "iframe[src*='recaptcha']",
-        "iframe[src*='hcaptcha']",
-        "iframe[src*='turnstile']",
-        "div.g-recaptcha",
-        "[data-sitekey]",
-    ):
-        if page.query_selector(sel):
-            return True
-    return False
+    """Best-effort detection of CAPTCHA / Cloudflare / bot-challenge pages.
+
+    Thin wrapper around :func:`akamai.detection.is_challenge` that preserves
+    the existing boolean callsite contract elsewhere in the file.
+    """
+    report = is_challenge(page, cfg=AKAMAI_CFG)
+    return report.status is not ChallengeStatus.CLEAR
 
 
 def _is_logged_in(page: Page) -> bool:
@@ -756,6 +680,26 @@ def run() -> int:
                     ok("Logged in.")
 
             account_email = detect_email(page, fallback=email)
+
+            # ---- Sensor warmup ----
+            # Run the human-like warmup loop so Akamai's bot manager flips
+            # ``_abck`` to "valid" before we hammer the account subpages.
+            # Skipped for MODE_OPEN_CHROME (mode 2): the user already drove
+            # the page like a human, the cookie is already good.
+            if mode != MODE_OPEN_CHROME:
+                step("Warming up Akamai sensor...")
+                wr = warm_up(page, cfg=AKAMAI_CFG)
+                if wr.succeeded:
+                    ok(
+                        f"Sensor accepted ({wr.elapsed_seconds:.1f}s, "
+                        f"{wr.attempts} micro-steps)"
+                    )
+                else:
+                    warn(
+                        f"Sensor warmup did not flip _abck "
+                        f"(status={wr.last_status.value}, {wr.detail}); "
+                        "continuing anyway."
+                    )
 
             # ---- Scrape phase ----
             _line()

@@ -107,6 +107,60 @@ The `.txt` report contains these sections, each clearly delimited with headers:
 
 If any section can't be parsed into structured fields, the tool falls back to dumping the visible page text under that section so nothing is lost.
 
+## Akamai bypass toolkit
+
+The repo ships a small standalone Python package — [`akamai/`](./akamai) —
+that contains everything `superdrug_report.py` uses to look like a normal
+Chrome session against Akamai Bot Manager. It's deliberately a kit of
+building blocks you can reuse:
+
+| Module | What it does |
+|--------|--------------|
+| `akamai.config`       | `BypassConfig` dataclass — UA, locale, viewport, sec-ch-ua, timings. |
+| `akamai.stealth`      | The big `addInitScript` payload (webdriver / plugins / userAgentData / WebGL / canvas / WebRTC / native-toString / …) plus Chrome launch flags. |
+| `akamai.cookies`      | Parse `_abck`, `bm_sz`, `ak_bmsc` and decide if the session is "valid". |
+| `akamai.detection`    | Detect Akamai / Cloudflare / generic CAPTCHA pages from URL + DOM + visible text. |
+| `akamai.human`        | Bezier-curved mouse moves, irregular scroll, per-key typing. |
+| `akamai.sensor`       | Drives a real-looking interaction loop until `_abck` flips to good. |
+| `akamai.http_client`  | Optional `curl_cffi` wrapper for raw HTTP calls with Chrome JA3. |
+| `akamai.session`      | High-level `AkamaiSession` that ties the rest together. |
+| `akamai.cli`          | `python -m akamai check <URL>` smoke test. |
+
+### Standalone smoke test
+
+```bash
+# Probe any URL and report whether the bypass clears the Akamai challenge.
+python -m akamai check https://www.superdrug.com/login
+
+# Same, but show the browser window and don't run the warmup loop.
+python -m akamai check https://www.superdrug.com/login --headed --no-warmup
+
+# Print the active default config (Chrome 131 / Linux / en-GB).
+python -m akamai info
+```
+
+### Programmatic use
+
+```python
+from akamai import AkamaiSession
+
+with AkamaiSession() as sess:
+    report = sess.goto("https://www.superdrug.com/login")
+    if report.blocked:
+        sess.warm_up("https://www.superdrug.com/")
+    page = sess.page                 # plain Playwright Page from here on
+    # ... drive page.fill / page.click / etc ...
+    cookies = sess.cookies()         # AkamaiCookies snapshot
+    assert cookies.is_valid          # _abck flag != "-1"
+```
+
+If you want to keep the browser warm but switch to raw HTTP for an API call:
+
+```python
+client = sess.http_client()          # curl_cffi.Session w/ Chrome JA3
+r = client.get("https://www.superdrug.com/api/orders")
+```
+
 ## Troubleshooting
 
 - **"Couldn't auto-login — Superdrug looks like it's flagging the script."** Akamai's bot detector is having a moment. Pick option 2 from the menu next time — that uses your real Chrome and is essentially undetectable.

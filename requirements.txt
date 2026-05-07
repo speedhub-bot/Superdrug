@@ -1,1 +1,5 @@
 playwright>=1.47
+# Optional: Chrome-impersonating TLS fingerprint for raw HTTP calls.
+# Used by `akamai.http_client.AkamaiHttpClient` and imported lazily; the rest
+# of the toolkit (and superdrug_report.py) work fine without it.
+curl_cffi>=0.7
